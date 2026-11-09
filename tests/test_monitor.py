@@ -20,13 +20,15 @@ class MonitorTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         fake = self.root / 'nix'
         fake.write_text(f'#!{sys.executable}\n' + '''
-import json, os, socket, sys
+import json, os, socket, sys, time
 args=sys.argv[1:]
 if '--option' in args and 'no-log' not in args:
  p=args[args.index('--option')+2]
- s=socket.socket(socket.AF_UNIX);s.connect(p)
- s.sendall((json.dumps({'action':'start','id':1,'level':3,'type':105,'text':'build','fields':[],'parent':0})+'\\n').encode())
- s.sendall(b'{"action":"stop","id":1}\\n');s.close()
+ for _ in range(2 if 'twice' in args else 1):
+  s=socket.socket(socket.AF_UNIX);s.connect(p)
+  s.sendall((json.dumps({'action':'start','id':1,'level':3,'type':105,'text':'build','fields':[],'parent':0})+'\\n').encode())
+  s.sendall(b'{"action":"stop","id":1}\\n');s.close()
+  time.sleep(0.05)
 print('FACTS='+json.dumps({'tty':[os.isatty(i) for i in range(3)],'args':args}))
 if 'read-input' in args: print('INPUT='+input())
 if 'fail' in args: sys.exit(37)
@@ -108,6 +110,32 @@ print('MONITORED='+str(len(lines)),file=sys.stderr)
         (self.root/'nom').write_text(f'#!{sys.executable}\nraise SystemExit(9)\n')
         code,out=self.run_tty(['run','ref','--','fail'])
         self.assertEqual(code,37,out)
+
+    def test_rebuild_keeps_multiple_nix_log_connections(self):
+        code,out=self.run_tty(['--rebuild',str(self.root/'nix'),'build','twice'])
+        self.assertEqual(code,0,out)
+        self.assertIn('MONITORED=4',out)
+
+    def test_rebuild_progress_does_not_enter_raw_log(self):
+        master,slave=pty.openpty()
+        log=self.root/'raw-log'
+        with log.open('w') as stream:
+            p=subprocess.Popen([sys.executable,str(self.script),'--rebuild',str(self.root/'nix'),'build','twice','fail'],
+                stdin=slave,stdout=stream,stderr=stream,pass_fds=(slave,),
+                env=os.environ | {'ZENOS_NOM_TTY_FD':str(slave)})
+            os.close(slave)
+            data=b'';deadline=time.monotonic()+5
+            while time.monotonic()<deadline:
+                if select.select([master],[],[],0.1)[0]:
+                    try:part=os.read(master,65536)
+                    except OSError:break
+                    if not part:break
+                    data+=part
+            os.close(master)
+            self.assertEqual(p.wait(timeout=2),37)
+        self.assertIn('MONITORED=4',data.decode())
+        self.assertIn('FACTS=',log.read_text())
+        self.assertNotIn('MONITORED',log.read_text())
 
     def test_no_connection_does_not_hold_terminal(self):
         code,out=self.run_tty(['run','--help'])
